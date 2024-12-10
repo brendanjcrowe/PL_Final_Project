@@ -1,26 +1,32 @@
 Require Import Coq.ZArith.ZArith.
 Require Import Coq.Lists.List.
+Require Import Lia.
 
 
 Module Exp.
 
 Inductive mem_loc : Type :=
+| NullPtr : mem_loc
 | MemLoc : nat -> mem_loc.
 
 Definition mem_loc_to_nat (loc : mem_loc) : nat :=
 match loc with
   | MemLoc n => n
+  | NullPtr => 0
 end.
 
 
 Inductive ref_type : Type :=
 | RefMut : mem_loc -> ref_type  
-| RefImm : mem_loc -> ref_type.
+| RefImm : list mem_loc -> ref_type.
 
-Definition ref_to_mem_loc (ref : ref_type) : mem_loc :=
+Definition ref_to_mem_loc (ref : ref_type) : option mem_loc :=
 match ref with
-| RefMut loc => loc
-| RefImm loc => loc
+| RefMut loc => Some loc
+| RefImm locs => match locs with
+  | loc :: _ => Some loc
+  | nil => None
+  end
 end.
 
 Inductive value : Type :=
@@ -63,8 +69,9 @@ Inductive borrow_state : Type :=
 | MutBorrowed : mem_loc -> borrow_state
 | ImmBorrowed : list mem_loc -> borrow_state.
 
-Definition update_memory (m : memory_state) (loc : mem_loc) (v : option ownership) : memory_state :=
+Definition update_memory (m : memory_state) (loc : option mem_loc) (v : option ownership) : memory_state :=
 fun l => 
+  if (mem_loc_to_nat l) = NullPtr then
   if Nat.eqb (mem_loc_to_nat l) (mem_loc_to_nat loc) then v 
   else m l.
 
@@ -78,6 +85,12 @@ with eval_error : Type :=
 | TypeMismatch : eval_error
 | OtherError : eval_error.
 
+Lemma success_neq_failure :
+forall (m : memory_state) (v : value) (err : eval_error ),
+EvalSuccess m v <> EvalError err.
+Proof.
+intros. discriminate. Qed.
+
 
 Fixpoint eval (m : memory_state) (e : expression) : eval_result :=
 match e with
@@ -85,9 +98,9 @@ match e with
   | EVar x =>
     match m (MemLoc (var_to_nat x)) with
     | Some (Own v) => EvalSuccess m v
-    | Some (OwnMut v) => EvalSuccess m v 
-    | Some (BorrowMut _) => EvalError (BorrowConflict (MemLoc (var_to_nat x)))
-    | Some (BorrowImm _) => EvalError (BorrowConflict (MemLoc (var_to_nat x))) 
+    | Some (OwnMut v) => EvalSuccess m v
+    | Some (BorrowMut loc) => EvalSuccess m (VRefMut (RefMut loc))
+    | Some (BorrowImm locs) => EvalSuccess m (VRefImmMut (RefImm (MemLoc (var_to_nat x) :: locs)))
     | None => EvalError (UninitializedMemory (MemLoc (var_to_nat x)))
     end
   | EAssign loc e' =>
@@ -115,8 +128,8 @@ match e with
       end
   | EImmBorrow loc =>
       match m loc with
-      | Some (Own v) => EvalSuccess (update_memory m loc (Some (BorrowImm (loc :: nil)))) (VRefImmMut (RefImm loc))
-      | Some (BorrowImm l) => EvalSuccess (update_memory m loc (Some (BorrowImm (loc :: l)))) (VRefImmMut (RefImm loc))
+      | Some (Own v) => EvalSuccess (update_memory m loc (Some (BorrowImm (loc :: nil)))) (VRefImmMut (RefImm (loc :: nil)))
+      | Some (BorrowImm l) => EvalSuccess (update_memory m loc (Some (BorrowImm (loc :: l)))) (VRefImmMut (RefImm (loc :: l)))
       | Some _ => EvalError (BorrowConflict loc)
       | None => EvalError (UninitializedMemory loc)
       end
@@ -197,7 +210,7 @@ Inductive well_typed : lifetime_state -> memory_state -> expression -> ref_type 
     match m (MemLoc (var_to_nat x)) with
     | Some (Own _) => r = RefImm (MemLoc (var_to_nat x))
     | Some (BorrowMut loc) => r = RefMut loc
-    | Some (BorrowImm locs) => r = RefImm (MemLoc (var_to_nat x))
+    | Some (BorrowImm locs) => r = RefImm (MemLoc (var_to_nat x) :: locs)
     | _ => False 
     end ->
     well_typed l m (EVar x) r
@@ -305,8 +318,8 @@ Proof.
   - intros. simpl. destruct (m (MemLoc (var_to_nat x))) eqn:Hmem.
     + destruct o.
       * exists m, v0. reflexivity.
-      * exists m, v. admit. (* apply none_some_neq with (m := m) (v := v). *)
-      * exists m, v. admit.
+      * exists m, (VRefMut (RefMut m0)). reflexivity. (* apply none_some_neq with (m := m) (v := v). *)
+      * exists m, (VRefMut (RefImm (m :: locs))).
         (* exfalso. assumption. *)
       * exfalso. assumption. 
     + exfalso. assumption. 
@@ -317,10 +330,12 @@ Proof.
       * exists (update_memory m (MemLoc (var_to_nat x)) (Some (BorrowMut (MemLoc (var_to_nat x))))),
                (VRefMut (RefMut (MemLoc (var_to_nat x)))).
         simpl. rewrite Hmem. reflexivity.
-      * exists m, v. simpl. rewrite Hmem.
-        (* exfalso. assumption. *) admit.
-      *  exists m, v. simpl. rewrite Hmem. admit.
-      * exists m, v. simpl. rewrite Hmem. admit.
+      * simpl in *. rewrite Hmem in *. exists m, v. destruct IHHtype. destruct H. discriminate H. 
+      *   simpl in *. rewrite Hmem in *. absurd (EvalSuccess m v = EvalError (BorrowConflict (MemLoc (var_to_nat x)))). 
+        -- discriminate.
+        -- destruct IHHtype. destruct H. discriminate H.
+      * exists (update_memory m (MemLoc (var_to_nat x)) (Some (BorrowMut (MemLoc (var_to_nat x))))),
+               (VRefMut (RefMut (MemLoc (var_to_nat x)))). simpl. rewrite Hmem.
     +  exists m, v. simpl. rewrite Hmem. admit.
 
   (* Case: TImmBorrow (EImmBorrow) *)
