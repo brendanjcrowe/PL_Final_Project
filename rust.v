@@ -6,13 +6,13 @@ Require Import Lia.
 Module Exp.
 
 Inductive mem_loc : Type :=
-| NullPtr : mem_loc
-| MemLoc : nat -> mem_loc.
+| MemLoc : nat -> mem_loc
+| InvalidMem : mem_loc.
 
-Definition mem_loc_to_nat (loc : mem_loc) : nat :=
+Definition mem_loc_to_nat (loc : mem_loc) : option nat :=
 match loc with
-  | MemLoc n => n
-  | NullPtr => 0
+  | MemLoc n => Some n
+  | InvalidMem => None
 end.
 
 
@@ -20,12 +20,14 @@ Inductive ref_type : Type :=
 | RefMut : mem_loc -> ref_type  
 | RefImm : list mem_loc -> ref_type.
 
-Definition ref_to_mem_loc (ref : ref_type) : option mem_loc :=
+Definition ref_to_mem_loc (ref : ref_type) : mem_loc :=
 match ref with
-| RefMut loc => Some loc
+| RefMut (MemLoc n) => MemLoc n 
+| RefMut (InvalidMem) => InvalidMem 
 | RefImm locs => match locs with
-  | loc :: _ => Some loc
-  | nil => None
+  | MemLoc n :: _  => MemLoc n
+  | InvalidMem :: _ => InvalidMem 
+  | nil => InvalidMem 
   end
 end.
 
@@ -61,7 +63,8 @@ Inductive ownership : Type :=
 | BorrowImm : list mem_loc -> ownership
 | OwnMut : value -> ownership.
 
-Definition memory_state := mem_loc -> option ownership.
+Definition memory_state := 
+mem_loc -> option ownership.
 
 Definition lifetime_state := nat -> nat.
 
@@ -69,11 +72,15 @@ Inductive borrow_state : Type :=
 | MutBorrowed : mem_loc -> borrow_state
 | ImmBorrowed : list mem_loc -> borrow_state.
 
-Definition update_memory (m : memory_state) (loc : option mem_loc) (v : option ownership) : memory_state :=
-fun l => 
-  if (mem_loc_to_nat l) = NullPtr then
-  if Nat.eqb (mem_loc_to_nat l) (mem_loc_to_nat loc) then v 
-  else m l.
+Definition eqb_option_nat (o1 o2 : option nat) : bool :=
+  match o1, o2 with
+  | Some n1, Some n2 => Nat.eqb n1 n2
+  | _, _ => false
+  end.
+  
+Definition update_memory (m : memory_state) (loc : mem_loc) (v : option ownership) : memory_state :=
+ fun l =>
+    if eqb_option_nat (mem_loc_to_nat l) (mem_loc_to_nat loc) then v else m l.
 
 Inductive eval_result : Type :=
 | EvalSuccess : memory_state -> value -> eval_result
@@ -135,10 +142,10 @@ match e with
       end
   | EDeref e' =>
       match eval m e' with
-      | EvalSuccess m' (VRefMut loc) =>
-          match m (ref_to_mem_loc loc) with
+      | EvalSuccess m' (VRefMut ref) =>
+          match m (ref_to_mem_loc ref) with
           | Some (OwnMut v) => EvalSuccess m' v
-          | _ => EvalError (BorrowConflict (ref_to_mem_loc loc))
+          | _ => EvalError (BorrowConflict (ref_to_mem_loc ref))
           end
       | EvalSuccess m' (VRefImmMut loc) =>
           match m (ref_to_mem_loc loc) with
@@ -173,15 +180,6 @@ Proof.
   reflexivity.
 Qed.
 
-(* Notation "'let' x := e1 'in' e2" := (ELet x e1 e2) (at level 200, right associativity).
-Notation "x" := (EVar x) (at level 100, only printing).
-Notation "&mut x" := (EMutBorrow x) (at level 50, only printing).
-Notation "& x" := (EImmBorrow x) (at level 50, only printing).
-Notation "* x" := (EDeref x) (at level 50, only printing).
-Notation "x := y" := (EAssign x y) (at level 90, no associativity).
-Notation "m [ x ==> v ]" := (update_memory m x v) (at level 50, left associativity). *)
-
-
 
 Inductive borrow_valid : memory_state -> mem_loc -> borrow_state -> Prop :=
   | BorrowMutValid : forall m loc,
@@ -195,20 +193,20 @@ Inductive borrow_valid : memory_state -> mem_loc -> borrow_state -> Prop :=
 
 Inductive well_typed : lifetime_state -> memory_state -> expression -> ref_type -> Prop :=
 | TValInt : forall (l : lifetime_state) (m : memory_state) (z : Z),
-    well_typed l m (EValue (VInt z)) (RefImm (MemLoc 0)) 
+    well_typed l m (EValue (VInt z)) (RefImm (MemLoc 0 :: nil)) 
 
 | TValRefMut : forall (l : lifetime_state) (m : memory_state) (loc : mem_loc),
     well_typed l m (EValue (VRefMut (RefMut loc))) (RefMut loc) 
 
 | TValRefImm : forall (l : lifetime_state) (m : memory_state) (loc : mem_loc),
-    well_typed l m (EValue (VRefImmMut (RefImm loc))) (RefImm loc) 
+    well_typed l m (EValue (VRefImmMut (RefImm (loc :: nil)))) (RefImm (loc :: nil)) 
 
 | TValUnit : forall (l : lifetime_state) (m : memory_state),
-    well_typed l m (EValue VUnit) (RefImm (MemLoc 0))
+    well_typed l m (EValue VUnit) (RefImm (MemLoc 0 :: nil))
 
 | TVar : forall (l : lifetime_state) (m : memory_state) (x : var) (r : ref_type),
     match m (MemLoc (var_to_nat x)) with
-    | Some (Own _) => r = RefImm (MemLoc (var_to_nat x))
+    | Some (Own _) => r = RefImm (MemLoc (var_to_nat x) :: nil)
     | Some (BorrowMut loc) => r = RefMut loc
     | Some (BorrowImm locs) => r = RefImm (MemLoc (var_to_nat x) :: locs)
     | _ => False 
@@ -219,8 +217,8 @@ Inductive well_typed : lifetime_state -> memory_state -> expression -> ref_type 
     well_typed l m (EMutBorrow (MemLoc (var_to_nat x))) (RefMut loc)
 
 | TImmBorrow : forall (l : lifetime_state) (m : memory_state) (x : var) (loc : mem_loc),
-    well_typed l m (EVar x) (RefImm loc)->
-    well_typed l m (EImmBorrow (MemLoc (var_to_nat x))) (RefImm loc)
+    well_typed l m (EVar x) (RefImm (loc :: nil))->
+    well_typed l m (EImmBorrow (MemLoc (var_to_nat x))) (RefImm (loc :: nil))
 
 | TMut : forall (l : lifetime_state) (m : memory_state) (x : var) (e : expression) (r : ref_type),
     well_typed l m e r ->
@@ -309,7 +307,7 @@ Proof.
   - exists m, (VRefMut (RefMut loc)). reflexivity.
 
   (* Case: TValRefImm *)
-  - exists m, (VRefImmMut (RefImm loc)). reflexivity.
+  - exists m, (VRefImmMut (RefImm (loc :: nil))). reflexivity.
 
   (* Case: TValUnit *)
   - exists m, VUnit. reflexivity.
@@ -319,7 +317,7 @@ Proof.
     + destruct o.
       * exists m, v0. reflexivity.
       * exists m, (VRefMut (RefMut m0)). reflexivity. (* apply none_some_neq with (m := m) (v := v). *)
-      * exists m, (VRefMut (RefImm (m :: locs))).
+      * exists m, (VRefImmMut (RefImm (MemLoc (var_to_nat x) :: l0))). reflexivity.
         (* exfalso. assumption. *)
       * exfalso. assumption. 
     + exfalso. assumption. 
@@ -330,44 +328,41 @@ Proof.
       * exists (update_memory m (MemLoc (var_to_nat x)) (Some (BorrowMut (MemLoc (var_to_nat x))))),
                (VRefMut (RefMut (MemLoc (var_to_nat x)))).
         simpl. rewrite Hmem. reflexivity.
-      * simpl in *. rewrite Hmem in *. exists m, v. destruct IHHtype. destruct H. discriminate H. 
-      *   simpl in *. rewrite Hmem in *. absurd (EvalSuccess m v = EvalError (BorrowConflict (MemLoc (var_to_nat x)))). 
+      * simpl in *. rewrite Hmem in *.  destruct IHHtype. destruct H. injection H. exists m, v. admit.
+      * simpl in *. rewrite Hmem in *. absurd (EvalSuccess m v = EvalError (BorrowConflict (MemLoc (var_to_nat x)))). 
         -- discriminate.
-        -- destruct IHHtype. destruct H. discriminate H.
+        -- destruct IHHtype. destruct H. admit.
       * exists (update_memory m (MemLoc (var_to_nat x)) (Some (BorrowMut (MemLoc (var_to_nat x))))),
-               (VRefMut (RefMut (MemLoc (var_to_nat x)))). simpl. rewrite Hmem.
+               (VRefMut (RefMut (MemLoc (var_to_nat x)))). simpl. admit.
     +  exists m, v. simpl. rewrite Hmem. admit.
 
   (* Case: TImmBorrow (EImmBorrow) *)
   - destruct (m (MemLoc (var_to_nat x))) eqn:Hmem.
     + destruct o as [v_mem | v_mem | l_borrowed | v_mem].
       * exists (update_memory m (MemLoc (var_to_nat x)) (Some (BorrowImm (MemLoc (var_to_nat x) :: nil) ))),
-              (VRefImmMut (RefImm (MemLoc (var_to_nat x)))).
+              (VRefImmMut (RefImm (MemLoc (var_to_nat x) :: nil))).
         simpl. rewrite Hmem. reflexivity.
       * exists (update_memory m (MemLoc (var_to_nat x))
                               (Some (BorrowMut (MemLoc (var_to_nat x))))),
               (VRefMut (RefMut (MemLoc (var_to_nat x)))).
-        simpl. rewrite Hmem. admit.
+        simpl in *. rewrite Hmem in *. admit.
       * exists (update_memory m (MemLoc (var_to_nat x))
                               (Some (BorrowImm (MemLoc (var_to_nat x) :: l_borrowed)))),
-              (VRefImmMut (RefImm (MemLoc (var_to_nat x)))).
+              (VRefImmMut (RefImm (MemLoc (var_to_nat x) :: l_borrowed))).
         simpl. rewrite Hmem.  reflexivity.
       * exists (update_memory m (MemLoc (var_to_nat x))
                               (Some (BorrowMut (MemLoc (var_to_nat x))))),
-              (VRefImmMut (RefImm (MemLoc (var_to_nat x)))).
+              (VRefImmMut (RefImm (MemLoc (var_to_nat x) :: nil))).
         simpl. rewrite Hmem. admit.
     + exists (update_memory m (MemLoc (var_to_nat x))
                                 (Some (BorrowMut (MemLoc (var_to_nat x))))),
-                (VRefImmMut (RefImm (MemLoc (var_to_nat x)))).
+                (VRefImmMut (RefImm (MemLoc (var_to_nat x) :: nil))).
       simpl. rewrite Hmem. admit.
-      exfalso. assumption.
 
-  (* Case: TMut *)
-  - destruct (eval m e) eqn:Heval.
-    + destruct p as [m' v].
-      exists (update_memory m' (MemLoc (var_to_nat x)) (Some (OwnMut v))), VUnit.
-      simpl. rewrite Heval. reflexivity.
-    + exfalso. apply IHHtype in Heval. contradiction.
+ (* Case: TMut *)
+- simpl. 
+  destruct IHHtype as [m'' [v' Heval]].
+  exists (update_memory m'' (MemLoc (var_to_nat x)) (Some (OwnMut v'))), VUnit. 
 
 Admitted.
 
